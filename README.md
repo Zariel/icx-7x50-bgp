@@ -82,12 +82,15 @@ uv run python -m unittest discover -s bgp_ufi_patcher/tests -v
 
 FastIron derives a one-bit software-package enum on demand from chassis-family
 and per-unit licence state. Two CLI front ends independently test that enum
-against selector 4's supported-package mask:
+against supported-package masks: selector 4 admits the main BGP family, and
+selector 10 admits IPv6 BGP configuration, show, and clear commands.
 
-| Binary | Role | Selector-4 file offset | Selector-4 VA |
-|---|---|---:|---:|
-| `fi_cfg_parser` | saved configuration parsing | `0x002c2fcd` | `0x002cafcd` |
-| `fi_cli_shell` | interactive CLI validation | `0x002ba9c3` | `0x002c29c3` |
+| Binary | Selector | File offset | VA |
+|---|---:|---:|---:|
+| `fi_cfg_parser` | 4 | `0x002c2fcd` | `0x002cafcd` |
+| `fi_cfg_parser` | 10 | `0x002c2ffd` | `0x002caffd` |
+| `fi_cli_shell` | 4 | `0x002ba9c3` | `0x002c29c3` |
+| `fi_cli_shell` | 10 | `0x002ba9f3` | `0x002c29f3` |
 
 The stock eight-byte entry is a big-endian mask followed by zero:
 
@@ -104,13 +107,32 @@ ICX7250 L3 bit: 0x00080000   -> mask 0x044e0002
 both:                         -> mask 0x046e0002
 ```
 
-Each ELF therefore changes at exactly one byte. ICX7150 BASE L3
+Each ELF therefore changes at exactly two bytes, one per selector.
+ICX7150 BASE L3
 (`0x00100000`) and ICX7250 BASE L3 (`0x01000000`) remain absent. The patch does
 not alter chassis identity, licence handling, software-package derivation,
 the generic selector predicate, individual CLI nodes, `FastIron`, the kernel,
 the FIT, or U-Boot. Hardware testing established that the parser-only patch
 was insufficient; both copies are required, and the two-gate image admits BGP
 on an ICX7150.
+
+## Hardware validation and CLI limitation
+
+On an ICX7150-C12P, the selector-4/10 build retained IPv4 BGP configuration
+and established an IPv6 BGP session. A received IPv6 test prefix appeared in
+the routing table and forwarding cache. Transit traffic succeeded; withdrawing
+the prefix removed the route and cache entry and stopped traffic. Restoring
+the advertisement restored forwarding. Enable `ipv6 unicast-routing` for IPv6
+forwarding. ASIC table contents, throughput, scale, and IPv6 operation on an
+ICX7250 have not been independently validated.
+
+An interactive address-family transition produced unexpected configuration:
+after `address-family ipv6 unicast`, issuing `address-family ipv4 unicast`
+changed the prompt to IPv4 BGP mode, but a subsequent IPv4 `network` statement
+appeared as IPv6 `network ::/0`. The cause is unresolved. Leave configuration
+mode and re-enter `router bgp` before configuring IPv4 after IPv6, and verify
+the resulting running configuration before saving it. IPv4 network
+configuration worked correctly from a fresh BGP context.
 
 ## Licence selection versus feature policy
 
@@ -142,7 +164,7 @@ The stock package gates compare as follows:
 
 | Feature family | Selector(s) | Stock mask | 7450 BASE | 7450 L3 | 7250 BASE | 7250 L3 |
 |---|---:|---:|---:|---:|---:|---:|
-| BGP/BGP4+ | 4 | `0x04460002` | no | yes | no | **no** |
+| BGP/BGP4+ | 4, 10 | `0x04460002` | no | yes | no | **no** |
 | OSPF/OSPFv3 | 3 | `0x046e0002` | no | yes | no | yes |
 | IPv4 PIM/MSDP | 5 | `0x046e0002` | no | yes | no | yes |
 | PBR contexts | 8, 14 | `0x046e0002` | no | yes | no | yes |
@@ -157,9 +179,9 @@ found.
 
 The key contrast is that a licensed ICX7250 already derives
 `ICX7250_L3_SOFT_PACKAGE` and passes OSPF, PIM, and PBR masks. Stock BGP still
-rejects it because selector 4 contains the licensed ICX7450 bit
+rejects it because selectors 4 and 10 contain the licensed ICX7450 bit
 `0x00040000`, but not the licensed ICX7250 bit `0x00080000`. The patch changes
-only that feature policy. For a 7250-enabled build, selector 4 becomes
+only that feature policy. For a 7250-enabled build, both selectors become
 `0x044e0002`; the BASE enum remains excluded, so the L3 licence is still
 required. A combined 7150/7250 build uses `0x046e0002`, matching the existing
 OSPF/PIM/PBR package coverage without changing how any licence is obtained or
@@ -185,7 +207,7 @@ size. Package streams are nevertheless walked to decompressor EOF and checked
 against the known layout. `CliShellPkg.tar.gz` is at absolute offset
 `0x0482183b` and is `2,561,142` bytes in the stock image.
 
-The builder edits the two ELF bytes in the package's uncompressed tar, then
+The builder edits the four ELF bytes in the package's uncompressed tar, then
 recomputes the gzip CRC32/size trailer. The package reader relies on stock
 member framing, so the compressor pads with valid empty DEFLATE stored blocks
 to retain the exact compressed length. This is a known-image technique, not a
@@ -249,6 +271,5 @@ Consequences and limits:
   risk-free or establish unsupported routing scale limits.
 
 Implementation is split into `builder.py` (container rebuild and validation),
-`patches.py` (the two selector records), and `format.py` (minimal LINX/FIT
-parsing). No module imports the broader research tooling outside this
-repository.
+`patches.py` (the four selector records), and `format.py` (minimal LINX/FIT
+parsing).

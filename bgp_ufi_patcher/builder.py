@@ -1,6 +1,6 @@
 """Build a bootable UFI containing the narrow BGP package-gate patch.
 
-Only selector 4 in ``fi_cfg_parser`` and ``fi_cli_shell`` is changed.  Those
+Only selectors 4 and 10 in ``fi_cfg_parser`` and ``fi_cli_shell`` are changed.  Those
 independent gates decide whether configuration parsing and the interactive
 CLI admit BGP for the dynamically derived software-package enum.  This does
 not alter chassis detection, licence handling, package derivation, FastIron,
@@ -445,11 +445,6 @@ def patch_cli_tar(
             raise BuildError(
                 f"{target.artifact.name} SHA256 does not match the known artifact"
             )
-        entry_offset = target.artifact.selector_entry_offset
-        if original[entry_offset : entry_offset + len(ORIGINAL_ENTRY)] != ORIGINAL_ENTRY:
-            raise BuildError(
-                f"{target.artifact.name} selector-4 bytes do not match the known artifact"
-            )
         try:
             patched, differences = patch_bytes(
                 original,
@@ -459,13 +454,13 @@ def patch_cli_tar(
             )
         except PatchError as error:
             raise BuildError(str(error)) from error
-        if differences != (target.artifact.changed_byte_offset,):
+        if differences != target.artifact.changed_offsets:
             raise BuildError(
-                f"{target.artifact.name} patch is not the expected one-byte change"
+                f"{target.artifact.name} patch is not the expected two-byte change"
             )
         patched_tar[member.offset_data : member.offset_data + member.size] = patched
         patched_artifacts[target.artifact.name] = patched
-        expected_tar_offsets.append(member.offset_data + differences[0])
+        expected_tar_offsets.extend(member.offset_data + offset for offset in differences)
 
     actual_tar_offsets = [
         index
@@ -474,10 +469,10 @@ def patch_cli_tar(
     ]
     if actual_tar_offsets != sorted(expected_tar_offsets):
         raise BuildError(
-            "CliShellPkg tar changes are not exactly the two selector-4 bytes"
+            "CliShellPkg tar changes are not exactly the four selector-4/10 bytes"
         )
     if set(patched_artifacts) != {"fi_cfg_parser", "fi_cli_shell"}:
-        raise BuildError("both CLI selector-4 artifacts were not patched")
+        raise BuildError("both CLI artifacts were not patched")
     return bytes(patched_tar), patched_artifacts
 
 
@@ -490,7 +485,9 @@ def recompress_gzip(original: bytes, data: bytes) -> bytes:
         raise BuildError("unsupported gzip header")
     target_deflate_size = len(original) - 18
     empty_stored_block = b"\x00\x00\x00\xff\xff"
-    profiles = ((6, 7), (7, 6), (7, 7), (9, 7))
+    # Empty stored blocks add five bytes, so a profile must leave a
+    # nonnegative deficit divisible by five. Fail closed if none does.
+    profiles = ((6, 7), (7, 6), (7, 7), (9, 7), (6, 8), (6, 6))
     compressed: tuple[bytes, bytes, int] | None = None
     for level, memory_level in profiles:
         compressor = zlib.compressobj(
@@ -865,12 +862,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--enable-7150",
         action="store_true",
-        help="admit ICX7150_L3_SOFT_PACKAGE to selector 4",
+        help="admit ICX7150_L3_SOFT_PACKAGE to selectors 4 and 10",
     )
     parser.add_argument(
         "--enable-7250",
         action="store_true",
-        help="admit ICX7250_L3_SOFT_PACKAGE to selector 4",
+        help="admit ICX7250_L3_SOFT_PACKAGE to selectors 4 and 10",
     )
     parser.add_argument("--output", type=Path, help="new output path")
     return parser.parse_args(argv)
@@ -921,7 +918,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"input: {args.input}")
     print(f"input_sha256: {result.known.sha256}")
     print(f"known_release: {result.known.release}")
-    print(f"selector_4_mask: 0x{result.selected_mask:08x}")
+    print(f"selector_4_and_10_mask: 0x{result.selected_mask:08x}")
     print(f"enable_7150: {'yes' if args.enable_7150 else 'no'}")
     print(f"enable_7250: {'yes' if args.enable_7250 else 'no'}")
     print(f"output: {output}")

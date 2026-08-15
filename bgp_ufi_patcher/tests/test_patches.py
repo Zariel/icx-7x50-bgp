@@ -31,12 +31,12 @@ class PatchFastIronBgpTests(unittest.TestCase):
             if not path.is_file():
                 raise unittest.SkipTest(f"CLI extraction is not available: {path}")
 
-    def test_each_cli_artifact_changes_only_its_documented_byte(self) -> None:
+    def test_only_bgp_selectors_change(self) -> None:
         cases = (
-            (PARSER, patcher.PARSER_PATCH),
-            (SHELL, patcher.SHELL_PATCH),
+            (PARSER, patcher.PARSER_PATCH, (0x2C2FCE, 0x2C2FFE)),
+            (SHELL, patcher.SHELL_PATCH, (0x2BA9C4, 0x2BA9F4)),
         )
-        for source, artifact in cases:
+        for source, artifact, expected_offsets in cases:
             with self.subTest(artifact=artifact.name):
                 original = source.read_bytes()
                 with tempfile.TemporaryDirectory() as directory:
@@ -48,21 +48,18 @@ class PatchFastIronBgpTests(unittest.TestCase):
                     self.assertEqual(result.input_sha256, artifact.sha256)
                     self.assertEqual(
                         result.changed_offsets,
-                        (artifact.changed_byte_offset,),
+                        expected_offsets,
                     )
                     self.assertEqual(len(original), len(patched))
                     self.assertEqual(
                         patcher.differing_offsets(original, patched),
-                        (artifact.changed_byte_offset,),
+                        expected_offsets,
                     )
-                    self.assertEqual(
-                        patched[
-                            artifact.selector_entry_offset :
-                            artifact.selector_entry_offset
-                            + patcher.SELECTOR_ENTRY_SIZE
-                        ],
-                        patcher.PATCHED_ENTRY,
-                    )
+                    for offset in expected_offsets:
+                        self.assertEqual(
+                            patched[offset - 1 : offset + 7],
+                            bytes.fromhex("046e000200000000"),
+                        )
                     self.assertEqual(
                         stat.S_IMODE(output.stat().st_mode),
                         stat.S_IMODE(source.stat().st_mode),
@@ -92,9 +89,9 @@ class PatchFastIronBgpTests(unittest.TestCase):
             (False, True, 0x044E0002),
             (True, True, 0x046E0002),
         )
-        for source, artifact in (
-            (PARSER, patcher.PARSER_PATCH),
-            (SHELL, patcher.SHELL_PATCH),
+        for source, artifact, expected_offsets in (
+            (PARSER, patcher.PARSER_PATCH, (0x2C2FCE, 0x2C2FFE)),
+            (SHELL, patcher.SHELL_PATCH, (0x2BA9C4, 0x2BA9F4)),
         ):
             original = source.read_bytes()
             for enable_7150, enable_7250, expected_mask in cases:
@@ -110,18 +107,13 @@ class PatchFastIronBgpTests(unittest.TestCase):
                     )
                     self.assertEqual(
                         differences,
-                        (artifact.changed_byte_offset,),
+                        expected_offsets,
                     )
-                    self.assertEqual(
-                        int.from_bytes(
-                            patched[
-                                artifact.selector_entry_offset :
-                                artifact.selector_entry_offset + 4
-                            ],
-                            "big",
-                        ),
-                        expected_mask,
-                    )
+                    for offset in expected_offsets:
+                        self.assertEqual(
+                            int.from_bytes(patched[offset - 1 : offset + 3], "big"),
+                            expected_mask,
+                        )
 
     def test_rejects_empty_platform_selection(self) -> None:
         with self.assertRaisesRegex(patcher.PatchError, "at least one"):
@@ -142,17 +134,16 @@ class PatchFastIronBgpTests(unittest.TestCase):
             self.assertFalse(output.exists())
 
     def test_rejects_wrong_original_entry(self) -> None:
-        original = bytearray(PARSER.read_bytes())
-        original[patcher.PARSER_PATCH.changed_byte_offset] ^= 0x01
-        with self.assertRaisesRegex(patcher.PatchError, "entry mismatch"):
-            patcher.patch_bytes(
-                bytes(original),
-                artifact=patcher.PARSER_PATCH,
-            )
+        for offset in (0x2C2FCE, 0x2C2FFE):
+            with self.subTest(offset=hex(offset)):
+                original = bytearray(PARSER.read_bytes())
+                original[offset] ^= 0x01
+                with self.assertRaisesRegex(patcher.PatchError, "entry mismatch"):
+                    patcher.patch_bytes(bytes(original), artifact=patcher.PARSER_PATCH)
 
     def test_rejects_fastiron_executable(self) -> None:
         if not FASTIRON.is_file():
-            self.skipTest("Task 00 FastIron extraction is missing")
+            self.skipTest("FastIron fixture is not available")
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "output"
             with self.assertRaisesRegex(patcher.PatchError, "not a known"):

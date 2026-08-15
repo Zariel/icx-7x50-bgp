@@ -106,13 +106,13 @@ class BuildBgpUfiTests(unittest.TestCase):
         )
         self.assertEqual(
             [
-                target.artifact.selector_entry_offset
+                target.artifact.entry_offset(4)
                 for target in builder.SPR09010K.cli_members
             ],
             [0x002C2FCD, 0x002BA9C3],
         )
 
-    def test_cli_tar_patches_both_selector_4_copies(self) -> None:
+    def test_cli_tar_patches_bgp_selectors(self) -> None:
         if not FIRMWARE.is_file():
             self.skipTest(f"firmware fixture is not available: {FIRMWARE}")
         known = builder.identify_firmware(FIRMWARE)
@@ -142,7 +142,7 @@ class BuildBgpUfiTests(unittest.TestCase):
                         left != right
                         for left, right in zip(original_tar, patched_tar)
                     ),
-                    2,
+                    4,
                 )
                 rebuilt_gzip = builder.recompress_gzip(
                     original_gzip,
@@ -155,12 +155,13 @@ class BuildBgpUfiTests(unittest.TestCase):
                 )
                 for target in known.cli_members:
                     patched = artifacts[target.artifact.name]
-                    offset = target.artifact.selector_entry_offset
+                    offsets = {
+                        "fi_cfg_parser": (0x2C2FCD, 0x2C2FFD),
+                        "fi_cli_shell": (0x2BA9C3, 0x2BA9F3),
+                    }[target.artifact.name]
                     expected_entry = expected_mask.to_bytes(4, "big") + b"\0" * 4
-                    self.assertEqual(
-                        patched[offset : offset + len(builder.ORIGINAL_ENTRY)],
-                        expected_entry,
-                    )
+                    for offset in offsets:
+                        self.assertEqual(patched[offset : offset + 8], expected_entry)
 
     def test_gzip_rebuild_preserves_header_and_recomputes_trailer(self) -> None:
         source = b"stock tar bytes" * 200

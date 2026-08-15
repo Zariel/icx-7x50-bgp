@@ -1,28 +1,9 @@
-"""Apply the two byte-level selector-4 changes that admit BGP.
+"""Admit BGP and IPv6 BGP through selectors 4 and 10 in both CLI executables.
 
-Each CLI ELF has an eight-byte selector-4 entry: a big-endian package mask
-followed by zero.  Its generic validator intersects that mask with the
-software-package enum derived at runtime from chassis family and licence
-state.  The stock ``0x04460002`` mask admits ICX7450 L3 but omits the
-ICX7250 L3 (``0x00080000``) and ICX7150 L3 (``0x00200000``) bits.
-
-The same logical gate exists independently in two binaries and both copies
-must be changed:
-
-* ``fi_cfg_parser``: file ``0x2c2fcd``, VA ``0x2cafcd``
-* ``fi_cli_shell``:  file ``0x2ba9c3``, VA ``0x2c29c3``
-
-Adding either platform changes only the second byte of the mask.  Base-package
-bits remain absent, so BASE_L3 still fails.  Hardware testing established that
-the parser-only change is insufficient and that patching both gates enables
-the BGP CLI without changing ``FastIron`` itself.
-
-The licence remains authoritative: zero licence state derives a model-specific
-BASE enum, while nonzero L3 licence state derives the L3 bit added here.  This
-module widens only BGP's feature policy after that existing derivation.
-
-Inputs are recognized by full SHA256 and exact ELF layout.  Any unknown file,
-including ``FastIron``, is rejected rather than searched heuristically.
+Each eight-byte entry is a big-endian package mask followed by zero runtime
+exclusions. Add only the requested licensed L3 package bits, preserving BASE
+package rejection. Inputs are recognized by full SHA256; FastIron is unchanged.
+See README.md for patch addresses and validation limits.
 """
 
 from __future__ import annotations
@@ -36,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-SELECTOR_ENTRY = 4
+SELECTORS = (4, 10)
 SELECTOR_ENTRY_SIZE = 8
 ORIGINAL_ENTRY = bytes.fromhex("0446000200000000")
 PATCHED_ENTRY = bytes.fromhex("046e000200000000")
@@ -54,9 +35,14 @@ class ArtifactPatch:
     sha256: str
     size: int
     selector_table_va: int
-    selector_entry_va: int
-    selector_entry_offset: int
-    changed_byte_offset: int
+    selector_table_offset: int
+
+    def entry_offset(self, selector: int) -> int:
+        return self.selector_table_offset + selector * SELECTOR_ENTRY_SIZE
+
+    @property
+    def changed_offsets(self) -> tuple[int, ...]:
+        return tuple(self.entry_offset(selector) + 1 for selector in SELECTORS)
 
 
 PARSER_PATCH = ArtifactPatch(
@@ -64,9 +50,7 @@ PARSER_PATCH = ArtifactPatch(
     sha256="9f0ab954263f76e996da8e08499d5e17152d16768226649a777870cc2ec49824",
     size=4_171_776,
     selector_table_va=0x002CAFAD,
-    selector_entry_va=0x002CAFCD,
-    selector_entry_offset=0x002C2FCD,
-    changed_byte_offset=0x002C2FCE,
+    selector_table_offset=0x002C2FAD,
 )
 
 SHELL_PATCH = ArtifactPatch(
@@ -74,9 +58,7 @@ SHELL_PATCH = ArtifactPatch(
     sha256="5f3839ce95b89779a7798c5f9d30d5d12d49021d89b894954d77522d7408a2ea",
     size=4_136_292,
     selector_table_va=0x002C29A3,
-    selector_entry_va=0x002C29C3,
-    selector_entry_offset=0x002BA9C3,
-    changed_byte_offset=0x002BA9C4,
+    selector_table_offset=0x002BA9A3,
 )
 
 ARTIFACT_PATCHES = (PARSER_PATCH, SHELL_PATCH)
@@ -117,7 +99,7 @@ def validate_elf(data: bytes, artifact: ArtifactPatch) -> None:
         raise PatchError(
             f"{artifact.name} size mismatch: expected {artifact.size}, found {len(data)}"
         )
-    if len(data) <= artifact.selector_entry_offset + SELECTOR_ENTRY_SIZE:
+    if len(data) <= artifact.entry_offset(max(SELECTORS)) + SELECTOR_ENTRY_SIZE:
         raise PatchError(f"input is too short: {len(data)} bytes")
     # ELF32, big-endian, version 1, ARM e_machine (0x0028).
     if data[:7] != b"\x7fELF\x01\x02\x01":
@@ -145,32 +127,24 @@ def patch_bytes(
     enable_7250: bool = True,
 ) -> tuple[bytes, tuple[int, ...]]:
     validate_elf(original, artifact)
-    actual_entry = original[
-        artifact.selector_entry_offset : artifact.selector_entry_offset
-        + SELECTOR_ENTRY_SIZE
-    ]
-    if actual_entry != ORIGINAL_ENTRY:
-        raise PatchError(
-            "selector-4 entry mismatch at "
-            f"0x{artifact.selector_entry_offset:08x}: "
-            f"expected {ORIGINAL_ENTRY.hex()}, "
-            f"found {actual_entry.hex()}"
-        )
-
     mask = selected_mask(enable_7150=enable_7150, enable_7250=enable_7250)
     patched_entry = mask.to_bytes(4, "big") + b"\0" * 4
     patched = bytearray(original)
-    patched[
-        artifact.selector_entry_offset : artifact.selector_entry_offset
-        + SELECTOR_ENTRY_SIZE
-    ] = patched_entry
+    for selector in SELECTORS:
+        offset = artifact.entry_offset(selector)
+        actual_entry = original[offset : offset + SELECTOR_ENTRY_SIZE]
+        if actual_entry != ORIGINAL_ENTRY:
+            raise PatchError(
+                f"selector-{selector} entry mismatch at 0x{offset:08x}: "
+                f"expected {ORIGINAL_ENTRY.hex()}, found {actual_entry.hex()}"
+            )
+        patched[offset : offset + SELECTOR_ENTRY_SIZE] = patched_entry
+
     result = bytes(patched)
     differences = differing_offsets(original, result)
-    if differences != (artifact.changed_byte_offset,):
+    if differences != artifact.changed_offsets:
         formatted = ", ".join(f"0x{offset:08x}" for offset in differences)
         raise PatchError(f"unexpected changed offsets: {formatted or 'none'}")
-    if result[artifact.changed_byte_offset] != patched_entry[1]:
-        raise PatchError("internal error: selector byte does not match requested mask")
     return result, differences
 
 
@@ -256,16 +230,10 @@ def print_result(result: PatchResult, input_path: Path, output_path: Path) -> No
     print(f"output: {output_path}")
     print(f"output_sha256: {result.output_sha256}")
     print(f"selector_table_va: 0x{artifact.selector_table_va:08x}")
-    print(f"selector_entry: {SELECTOR_ENTRY}")
-    print(f"selector_entry_va: 0x{artifact.selector_entry_va:08x}")
-    print(
-        "selector_entry_file_offset: "
-        f"0x{artifact.selector_entry_offset:08x}"
-    )
-    print(
-        "changed_byte_file_offset: "
-        f"0x{artifact.changed_byte_offset:08x}"
-    )
+    for selector in SELECTORS:
+        va = artifact.selector_table_va + selector * SELECTOR_ENTRY_SIZE
+        print(f"selector_{selector}_va: 0x{va:08x}")
+        print(f"selector_{selector}_file_offset: 0x{artifact.entry_offset(selector):08x}")
     print(f"before: {result.before.hex()}")
     print(f"after:  {result.after.hex()}")
     print(
