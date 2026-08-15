@@ -1,0 +1,17 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bgp-ufi-patcher"
+version = "0.1.0"
+description = "Patch the FastIron 09.0.10k UFI BGP package gates"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+bgp-ufi-patcher = "bgp_ufi_patcher.builder:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["bgp_ufi_patcher"]
